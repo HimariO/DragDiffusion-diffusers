@@ -27,6 +27,7 @@ from einops import rearrange
 from torch import Tensor
 from packaging import version
 from transformers import CLIPImageProcessor, CLIPTextModel, CLIPTokenizer
+from termcolor import colored
 
 from diffusers import StableDiffusionInpaintPipeline, StableDiffusionPix2PixZeroPipeline
 from diffusers.models import AutoencoderKL, UNet2DConditionModel
@@ -168,10 +169,11 @@ class MotionSup:
             refernce_feat: Tensor,
             refernce_latent: Tensor,
             mask: Tensor,
-            steps=1):
-        self.init_latent = refernce_latent.float().clone()
+            steps=200,
+        ):
+        self.init_latent = refernce_latent.float().clone().detach()
         self.ref_latent = torch.nn.Parameter(refernce_latent.float())
-        self.ref_feat = refernce_feat
+        self.ref_feat = refernce_feat.clone().detach()
         self.mask = mask.float()
         self.adam = torch.optim.Adam([self.ref_latent], lr=1e-2)
         self.steps = steps
@@ -185,43 +187,25 @@ class MotionSup:
         self.handle_points = src_points.clone()
         
         c, h, w = refernce_feat.shape
-        self.radius = max(3, min(h, w) // 16)
-        self.sample_offsets = [
+        self.radius = max(1, min(h, w) // 8)
+        self.sample_offsets = self._radius_offset(1)
+        self.search_offsets = self._radius_offset(self.radius, include_origin=True)
+    
+    def _radius_offset(self, radius, include_origin=True):
+        c, h, w = self.ref_feat.shape
+        offsets = [
             [x / w, y / h]
             for y, x in product(
-                range(-self.radius, self.radius + 1),
-                range(-self.radius, self.radius + 1))
-            if (y**2 + x**2)**0.5 <= self.radius
+                range(-radius, radius + 1),
+                range(-radius, radius + 1))
+            if (y**2 + x**2)**0.5 <= radius and (not(x == 0 and y == 0) or include_origin)
         ]
-        self.sample_offsets = torch.tensor(
-            self.sample_offsets,
-            dtype=src_points.dtype,
-            device=src_points.device
+        offsets = torch.tensor(
+            offsets,
+            dtype=self.src_points.dtype,
+            device=self.src_points.device
         )
-    
-    def _search_handle(self, prev_feat: Tensor, feat_map: Tensor):
-        n = self.src_points.shape[0]
-        c, h, w = feat_map.shape
-        feat_map = torch.unsqueeze(feat_map, 0).float()
-        prev_feat = torch.unsqueeze(prev_feat, 0).float()
-        
-        src_pts_4d = self.handle_points.reshape([1, 1, n, 2])
-        src_feats = F.grid_sample(prev_feat, src_pts_4d)
-        src_feats = rearrange(src_feats, "b c h w -> (b h w) c")
-        flat_latent = rearrange(feat_map[0], "c h w -> (h w) c")
-        
-        dot = src_feats @ flat_latent.T
-        nearest = torch.argmax(dot, dim=1)
-        nearest_x = nearest % w
-        nearest_y = nearest // h
-        
-        self.handle_points = torch.stack([
-            nearest_x / w,
-            nearest_y / h,
-        ]).T
-        self.handle_points = (self.handle_points - 0.5) * 2
-        print("search_handle", torch.abs(prev_feat - feat_map).mean())
-        print(torch.abs(self.handle_points - self.dst_points))
+        return offsets
     
     def _radius_sample(self, feat_map, points, offsets):
         n = points.shape[0]
@@ -231,61 +215,60 @@ class MotionSup:
         feats = F.grid_sample(feat_map, points)
         return feats[0]
     
+    @torch.no_grad()
     def search_handle(self, prev_feat: Tensor, feat_map: Tensor):
         n = self.src_points.shape[0]
-        c, h, w = feat_map.shape
         feat_map = torch.unsqueeze(feat_map, 0).float()
         prev_feat = torch.unsqueeze(prev_feat, 0).float()
         
+        # src_pts_4d = self.src_points.reshape([1, 1, n, 2])
         src_pts_4d = self.handle_points.reshape([1, 1, n, 2])
         src_feats = F.grid_sample(prev_feat, src_pts_4d)
         src_feats = rearrange(src_feats, "b c h w -> (b h w) c")
 
-        offsets = self.sample_offsets
-        src_radius_feats = self._radius_sample(prev_feat, self.handle_points, offsets)
-        src_radius_feats = rearrange(src_radius_feats, "c offsets pts -> pts offsets c")
-        # flat_latent = rearrange(feat_map[0], "c h w -> (h w) c")
-        # flat_latent = rearrange(src_radius_feats, "b c r n -> (b r n) c")
+        offsets = self.search_offsets
+        radius_feats = self._radius_sample(feat_map, self.handle_points, offsets)
+        radius_feats = rearrange(radius_feats, "c offsets pts -> pts offsets c")
         
         new_handles = []
-        print("search_handle", torch.abs(prev_feat - feat_map).mean())
-        for src_pt, src_feat, rad_feat in zip(self.handle_points, src_feats, src_radius_feats):
-            dot = src_feat.unsqueeze(0) @ rad_feat.T
+        for src_pt, src_feat, rad_feat in zip(self.handle_points, src_feats, radius_feats):
+            A = F.normalize(src_feat.unsqueeze(0), dim=1)
+            B = F.normalize(rad_feat, dim=1)
+            dot = A @ B.T
             nearest = torch.argmax(dot, dim=1)
             new_handles.append(src_pt + offsets[nearest[0]])
             print(offsets[nearest[0]])
         
         self.handle_points = torch.stack(new_handles)
+        print(
+            "search_handle", 
+            torch.abs(self.handle_points - self.dst_points).sum(dim=1).cpu().numpy(),
+            torch.abs(self.ref_latent - self.init_latent).mean().cpu().numpy(),
+        )
         # print(torch.abs(self.handle_points - self.dst_points))
 
-    def step(self, feat_map: Tensor, prev_feat=None):
+    def step(self, feat_map: Tensor, prev_feat=None, reset_backbound=False):
         c, h, w = feat_map.shape
-        n = self.src_points.shape[0]
-        device = feat_map.device
-        
         offsets = self.sample_offsets
         feat_map = torch.unsqueeze(feat_map, dim=0).float()
         prev_feat = torch.unsqueeze(prev_feat, dim=0).float() if prev_feat is not None else feat_map
         
-        src_pts_4d = self.handle_points.reshape([1, 1, n, 2])
-        src_pts_4d = src_pts_4d.repeat([1, len(offsets), 1, 1])
-        src_pts_4d += offsets.reshape([1, len(offsets), 1, 2])
-        src_feats = F.grid_sample(prev_feat, src_pts_4d)
-        src_feats.detach()
-        
-        # track_points = self.handle_points + F.normalize(self.dst_points - self.handle_points) / self.steps
-        track_points = self.handle_points + (self.dst_points - self.handle_points) / self.steps
-        tar_pts_4d = track_points.reshape([1, 1, n, 2])
-        tar_pts_4d = tar_pts_4d.repeat([1, len(offsets), 1, 1])
-        tar_pts_4d += offsets.reshape([1, len(offsets), 1, 2])
-        tar_feats = F.grid_sample(feat_map, tar_pts_4d)
+        src_feats = self._radius_sample(prev_feat, self.handle_points, offsets)
+
+        norm_direct = F.normalize(self.dst_points - self.handle_points)
+        track_points = self.handle_points + norm_direct * 2 / min(h, w) * 4  # NOTE: try to move one "pixel" toward dst point on feature map
+        # track_points = self.handle_points + (self.dst_points - self.handle_points) / self.steps
+        tar_feats = self._radius_sample(feat_map, track_points, offsets)
         
         self.adam.zero_grad()
-        motion_l1_loss = F.l1_loss(tar_feats, src_feats)
+        motion_l1_loss = F.l1_loss(tar_feats, src_feats.detach())
         motion_l1_loss += F.l1_loss(self.ref_latent * self.mask, self.init_latent * self.mask) * 0.1
         motion_l1_loss.backward()
         self.adam.step()
-        print("motion_l1_loss: ", motion_l1_loss)
+        
+        if reset_backbound:
+            self.ref_latent.data = self.ref_latent * (1 - self.mask) + self.init_latent * self.mask
+        print(colored("motion_l1_loss: ", color='green'), float(motion_l1_loss))
 
 
 @dataclass
@@ -437,20 +420,6 @@ class DragDiffusionPipeline(StableDiffusionInpaintPipeline):
 
         return latents
 
-    def _encode_vae_image(self, image: torch.Tensor, generator: torch.Generator):
-        if isinstance(generator, list):
-            image_latents = [
-                self.vae.encode(image[i : i + 1]).latent_dist.sample(generator=generator[i])
-                for i in range(image.shape[0])
-            ]
-            image_latents = torch.cat(image_latents, dim=0)
-        else:
-            image_latents = self.vae.encode(image).latent_dist.sample(generator=generator)
-
-        image_latents = self.vae.config.scaling_factor * image_latents
-
-        return image_latents
-
     def prepare_mask_latents(
         self, mask, masked_image, batch_size, height, width, dtype, device, generator, do_classifier_free_guidance
     ):
@@ -492,41 +461,31 @@ class DragDiffusionPipeline(StableDiffusionInpaintPipeline):
         masked_image_latents = masked_image_latents.to(device=device, dtype=dtype)
         return mask, masked_image_latents
 
-    # Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_img2img.StableDiffusionImg2ImgPipeline.get_timesteps
-    def get_timesteps(self, num_inference_steps, strength, device):
-        # get the original timestep using init_timestep
-        init_timestep = min(int(num_inference_steps * strength), num_inference_steps)
-
-        t_start = max(num_inference_steps - init_timestep, 0)
-        timesteps = self.scheduler.timesteps[t_start * self.scheduler.order :]
-
-        return timesteps, num_inference_steps - t_start
-    
     @torch.enable_grad()
-    def tune_latent(self, latents, mask, timesteps, prompt_embeds, cross_attention_kwargs, handle_points, target_points):
+    def tune_latent(self, latents, mask, timestep, prompt_embeds, cross_attention_kwargs, handle_points, target_points):
         # 10. motion supervision and point tracking loop
         self.unet(
             latents,
-            timesteps[0],
+            timestep,
             encoder_hidden_states=prompt_embeds,
             cross_attention_kwargs=cross_attention_kwargs,
             return_dict=False,
         )
-        
         motion_track = MotionSup(handle_points, target_points, self.unet_feat_cache[0], latents, mask)
-        for _ in range(50):
+        
+        for _ in range(motion_track.steps):
             prev_feat = self.unet_feat_cache[0].clone()
             for i in range(1):
                 self.unet(
                     motion_track.ref_latent.to(latents.dtype),
-                    timesteps[0],
+                    timestep,
                     encoder_hidden_states=prompt_embeds,
                     cross_attention_kwargs=cross_attention_kwargs,
                     return_dict=False,
                 )
                 feat_map = self.unet_feat_cache[0]
-                motion_track.search_handle(prev_feat, feat_map)
-                motion_track.step(feat_map)  # update motion_track.ref_latent
+                motion_track.step(feat_map, prev_feat=None)  # update motion_track.ref_latent
+            motion_track.search_handle(motion_track.ref_feat, feat_map)
         return motion_track.ref_latent.to(latents.dtype).data
 
     @torch.no_grad()
@@ -695,6 +654,21 @@ class DragDiffusionPipeline(StableDiffusionInpaintPipeline):
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
+                # print('i', i, num_inference_steps, num_warmup_steps)
+                if i == int(num_inference_steps * .2):
+                    # image = self.vae.decode(latents / self.vae.config.scaling_factor, return_dict=False)[0]
+                    # image = self.image_processor.postprocess(image, output_type=output_type, do_denormalize=[True])
+                    # return image
+                    latents = self.tune_latent(
+                        latents,
+                        1 - mask,
+                        t,
+                        prompt_embeds,
+                        cross_attention_kwargs,
+                        handle_points,
+                        target_points
+                    )
+                
                 # expand the latents if we are doing classifier free guidance
                 latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
 
@@ -738,21 +712,6 @@ class DragDiffusionPipeline(StableDiffusionInpaintPipeline):
                     progress_bar.update()
                     if callback is not None and i % callback_steps == 0:
                         callback(i, t, latents)
-                
-                print('i', i, num_inference_steps, num_warmup_steps)
-                if i == int(num_inference_steps * 0.8):
-                    # image = self.vae.decode(latents / self.vae.config.scaling_factor, return_dict=False)[0]
-                    # image = self.image_processor.postprocess(image, output_type=output_type, do_denormalize=[True])
-                    # return image
-                    latents = self.tune_latent(
-                        latents,
-                        1 - mask,
-                        timesteps,
-                        prompt_embeds,
-                        cross_attention_kwargs,
-                        handle_points,
-                        target_points
-                    )
 
         if not output_type == "latent":
             image = self.vae.decode(latents / self.vae.config.scaling_factor, return_dict=False)[0]
