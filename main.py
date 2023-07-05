@@ -103,13 +103,16 @@ def run_drag_diffusion(
     target_points=None,
 ):
 
-    pipeline = DragDiffusionInpaintPipeline.from_pretrained(
+    pipeline = DragDiffusionPipeline.from_pretrained(
         "runwayml/stable-diffusion-v1-5",
         torch_dtype=torch.float16,
     )
     pipeline.unet.load_attn_procs(lora_model_path)
     pipeline = pipeline.to("cuda")
 
+    """
+    Prepare inputs
+    """
     init_image = Image.open(image_file).resize((512, 512))
     mask_image = Image.open(mask_file).resize((512, 512))
 
@@ -123,22 +126,18 @@ def run_drag_diffusion(
     handle_points_pt = (handle_points_pt - 0.5) * 2
     target_points_pt = (target_points_pt - 0.5) * 2
 
-    inv_pipeline = DragDiffusionPipeline(
-        vae=pipeline.vae,
-        text_encoder=pipeline.text_encoder,
-        tokenizer=pipeline.tokenizer,
-        unet=pipeline.unet,
-        scheduler=pipeline.scheduler,
-    )
-
     src_mask, src_masked, src_image = prepare_mask_and_masked_image(init_image, mask_image, 512, 512, return_image=True)
     src_mask = torch.nn.functional.interpolate(src_mask, size=(64, 64))
     
-    image_latents = inv_pipeline.get_image_latents(
+    image_latents = pipeline.get_image_latents(
         src_image.to("cuda").half())
-    text_embeddings = inv_pipeline.get_text_embedding(prompt)
+    text_embeddings = pipeline.get_text_embedding(prompt)
+
+    """
+    Inverse input image latent -> Drag handle point -> Denoise latent
+    """
     
-    reversed_latents = inv_pipeline.forward_diffusion(
+    reversed_latents = pipeline.forward_diffusion(
         latents=image_latents,
         text_embeddings=text_embeddings,
         guidance_scale=1,
@@ -146,10 +145,10 @@ def run_drag_diffusion(
         early_stop_step=40,
     )
 
-    drag_reverse_latents = inv_pipeline.tune_latent(
+    drag_reverse_latents = pipeline.tune_latent(
         reversed_latents.clone(),
         (1 - src_mask).to('cuda'), 
-        inv_pipeline.timesteps_tensor[-1].clone(),
+        pipeline.timesteps_tensor[-1].clone(),
         text_embeddings.clone(),
         {},
         handle_points_pt.to('cuda'),
@@ -159,19 +158,22 @@ def run_drag_diffusion(
 
     print("Draged latent delta: ", torch.abs(drag_reverse_latents - reversed_latents).mean())
     
-    reconstructed_latents = inv_pipeline.backward_diffusion(
+    reconstructed_latents = pipeline.backward_diffusion(
         latents=drag_reverse_latents,
         text_embeddings=text_embeddings,
         guidance_scale=1,
         num_inference_steps=50,
     )
-    
+
+    """
+    Visualize result
+    """
 
     # helper function to show images
     def latents_to_imgs(latents):
-        x = inv_pipeline.decode_image(latents)
-        x = inv_pipeline.torch_to_numpy(x)
-        x = inv_pipeline.numpy_to_pil(x)
+        x = pipeline.decode_image(latents)
+        x = pipeline.torch_to_numpy(x)
+        x = pipeline.numpy_to_pil(x)
         return x
     
     image = latents_to_imgs(reconstructed_latents)[0]
@@ -181,7 +183,6 @@ def run_drag_diffusion(
         draw.ellipse((x-5, y-5, x+5, y+5), fill = 'blue', width=10)
     for y, x in target_points:
         draw.ellipse((x-5, y-5, x+5, y+5), fill = 'red', width=10)
-    # init_image.show()
 
     plt.subplot(1, 2, 1)
     plt.imshow(init_image)
