@@ -6,6 +6,7 @@ from einops import rearrange
 from torch import Tensor
 from termcolor import colored
 
+
 def unet_feat_hook(pipeline, module, xin, xout):
     pipeline.unet_feat_cache = xout
 
@@ -23,7 +24,7 @@ class MotionSup:
             refernce_latent: Tensor,
             mask: Tensor,
             steps=150,
-            debug_log=True,
+            debug_log=False,
         ):
         self.init_latent = refernce_latent.float().clone().detach()
         self.ref_latent = torch.nn.Parameter(refernce_latent.float())
@@ -35,9 +36,9 @@ class MotionSup:
         self._debug_log = debug_log
         
         if not ((src_points <= 1).all() and (src_points >= -1).all()):
-            raise ValueError()
+            raise ValueError("Value of point coordinate should be within range of [-1, 1]")
         if not ((dst_points <= 1).all() and (dst_points >= -1).all()):
-            raise ValueError()
+            raise ValueError("Value of point coordinate should be within range of [-1, 1]")
         self.src_points = src_points
         self.dst_points = dst_points
         self.handle_points = src_points.clone()

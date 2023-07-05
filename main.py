@@ -1,16 +1,19 @@
+import fire
 import torch
-import requests
 import matplotlib.pyplot as plt
 from functools import partial
 
 from PIL import Image, ImageDraw
-from io import BytesIO
 from diffusers.schedulers import DDIMInverseScheduler
 
 from drag_inpaint_pipeline import DragDiffusionInpaintPipeline, prepare_mask_and_masked_image
 from drag_pipeline import DragDiffusionPipeline, load_img
 from motion_sup import MotionSup, unet_feat_hook
 
+
+DEFAULT_IMAGE = "asset/lora/train/overture-creations-5sI6fQgYIuo.png"
+DEFAULT_MASK = "asset/overture-creations-5sI6fQgYIuo_mask.png"
+DEFAULT_PROMPT = "A dog sitting on the bench in the park"
 
 
 def test_motion_super():
@@ -53,8 +56,8 @@ def run_drag_inpaint_diffusion():
     pipeline.unet.load_attn_procs(lora_model_path)
     pipeline = pipeline.to("cuda")
 
-    init_image = Image.open("asset/lora/train/overture-creations-5sI6fQgYIuo.png").resize((512, 512))
-    mask_image = Image.open("asset/overture-creations-5sI6fQgYIuo_mask.png").resize((512, 512))
+    init_image = Image.open(DEFAULT_IMAGE).resize((512, 512))
+    mask_image = Image.open(DEFAULT_MASK).resize((512, 512))
 
     handle_points = [[150, 245], [150, 270], [170, 255]]
     target_points = [[200, 240], [200, 265], [220, 250]]
@@ -63,20 +66,7 @@ def run_drag_inpaint_diffusion():
     handle_points_pt = (handle_points_pt - 0.5) * 2
     target_points_pt = (target_points_pt - 0.5) * 2
 
-    # inv_pipeline = DragDiffusionPipeline(
-    #     vae=pipeline.vae,
-    #     text_encoder=pipeline.text_encoder,
-    #     tokenizer=pipeline.tokenizer,
-    #     unet=pipeline.unet,
-    #     scheduler=pipeline.scheduler,
-    # )
-
-    prompt = "A dog sitting on the bench in the park"
-    # src_image = load_img("asset/lora/train/overture-creations-5sI6fQgYIuo.png", target_size=512)
-    # image_latents = inv_pipeline.get_image_latents(
-    #     src_image.unsqueeze(0).to("cuda").half())
-    # text_embeddings = inv_pipeline.get_text_embedding(prompt)
-
+    prompt = DEFAULT_PROMPT
 
     image = pipeline(
         prompt=prompt,
@@ -104,22 +94,30 @@ def run_drag_inpaint_diffusion():
     plt.show()
 
 
-def run_drag_diffusion():
-    lora_model_path = "./sd-model-lora"
+def run_drag_diffusion(
+    lora_model_path="./sd-model-lora",
+    image_file=DEFAULT_IMAGE,
+    mask_file=DEFAULT_MASK,
+    prompt=DEFAULT_PROMPT,
+    handle_points=None,
+    target_points=None,
+):
 
     pipeline = DragDiffusionInpaintPipeline.from_pretrained(
         "runwayml/stable-diffusion-v1-5",
         torch_dtype=torch.float16,
     )
-    # pipeline.inverse_scheduler = DDIMInverseScheduler.from_config(pipeline.scheduler.config)
     pipeline.unet.load_attn_procs(lora_model_path)
     pipeline = pipeline.to("cuda")
 
-    init_image = Image.open("asset/lora/train/overture-creations-5sI6fQgYIuo.png").resize((512, 512))
-    mask_image = Image.open("asset/overture-creations-5sI6fQgYIuo_mask.png").resize((512, 512))
+    init_image = Image.open(image_file).resize((512, 512))
+    mask_image = Image.open(mask_file).resize((512, 512))
 
-    handle_points = [[150, 245], [150, 270], [170, 255]]
-    target_points = [[200, 240], [200, 265], [220, 250]]
+    if handle_points is None:
+        handle_points = [[150, 245], [150, 270], [170, 255]]
+    if target_points is None:
+        target_points = [[200, 240], [200, 265], [220, 250]]
+    
     handle_points_pt = torch.tensor([[x / 512, y / 512] for y, x in handle_points])
     target_points_pt = torch.tensor([[x / 512, y / 512] for y, x in target_points])
     handle_points_pt = (handle_points_pt - 0.5) * 2
@@ -133,8 +131,6 @@ def run_drag_diffusion():
         scheduler=pipeline.scheduler,
     )
 
-    prompt = "A dog sitting on the bench in the park"
-    # src_image = load_img("asset/lora/train/overture-creations-5sI6fQgYIuo.png", target_size=512)
     src_mask, src_masked, src_image = prepare_mask_and_masked_image(init_image, mask_image, 512, 512, return_image=True)
     src_mask = torch.nn.functional.interpolate(src_mask, size=(64, 64))
     
@@ -161,7 +157,7 @@ def run_drag_diffusion():
         steps=120,
     )
 
-    print("Drag Diff: ", torch.abs(drag_reverse_latents - reversed_latents).mean())
+    print("Draged latent delta: ", torch.abs(drag_reverse_latents - reversed_latents).mean())
     
     reconstructed_latents = inv_pipeline.backward_diffusion(
         latents=drag_reverse_latents,
@@ -195,5 +191,8 @@ def run_drag_diffusion():
 
 
 if __name__ == '__main__':
-    # test_motion_super()
-    run_drag_diffusion()
+    fire.Fire({
+        "drag_diffusion": run_drag_diffusion,
+        "drag_inpaint_diffusion": run_drag_inpaint_diffusion,
+        "test_motion_super": test_motion_super,
+    })

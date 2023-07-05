@@ -1,0 +1,8 @@
+einops
+fire
+diffusers
+torch
+matplotlib
+pillow
+accelerate
+transformers
