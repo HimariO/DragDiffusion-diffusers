@@ -39,3 +39,11 @@ python3 main.py drag_diffusion --lora_model_path "./sd-model-lora"
 This is the result you should get with default parameters:
 
 ![](asset/demo.png)
+
+You can also output the intermidate latent produced by motion supervision process as a GIF with `output_gif_path` parameter. 
+
+```shell
+python3 main.py drag_diffusion --lora_model_path "./sd-model-lora" --output_gif_path "out.gif"
+```
+
+![](asset/demo.gif)

@@ -133,6 +133,7 @@ class DragDiffusionPipeline(DiffusionPipeline):
         handle_points,
         target_points,
         steps=150,
+        return_inbetween=False,
     ):
         self.unet(
             latents,
@@ -149,22 +150,32 @@ class DragDiffusionPipeline(DiffusionPipeline):
             mask,
             steps=steps
         )
+        
+        cache = []
+        cache_step = list(range(0, steps, max(1, steps // 16))) + [steps - 1]
         bar = tqdm(range(motion_track.steps))
         for j in bar:
-            prev_feat = self.unet_feat_cache[0].clone()
-            for i in range(1):
-                self.unet(
-                    motion_track.ref_latent.to(latents.dtype),
-                    timestep,
-                    encoder_hidden_states=prompt_embeds,
-                    cross_attention_kwargs=cross_attention_kwargs,
-                    return_dict=False,
-                )
-                feat_map = self.unet_feat_cache[0]
-                loss = motion_track.step(feat_map, prev_feat=None)  # update motion_track.ref_latent
+            self.unet(
+                motion_track.ref_latent.to(latents.dtype),
+                timestep,
+                encoder_hidden_states=prompt_embeds,
+                cross_attention_kwargs=cross_attention_kwargs,
+                return_dict=False,
+            )
+            feat_map = self.unet_feat_cache[0]
+            loss = motion_track.step(feat_map, prev_feat=None)  # update motion_track.ref_latent
             motion_track.search_handle(motion_track.ref_feat, feat_map)
             bar.set_postfix({"l1_loss": loss})
-        return motion_track.ref_latent.to(latents.dtype).data
+            
+            if return_inbetween and j in cache_step:
+                cur_latent = motion_track.ref_latent.data.clone().detach()
+                cache.append(cur_latent.to(latents.dtype))
+        
+        final_latent = motion_track.ref_latent.to(latents.dtype).data
+        if return_inbetween:
+            return final_latent, cache
+        else:
+            return final_latent
     
     @property
     def timesteps_tensor(self):
@@ -186,8 +197,11 @@ class DragDiffusionPipeline(DiffusionPipeline):
         early_stop_step: Optional[int] = None,
         **kwargs,
     ):
-        """ Generate image from text prompt and latents
+        """ 
+        Generate image from text prompt and latents
         """
+
+        assert latents.size(0) == 1, "Current implmentation don't support batch size > 1!"
         # here `guidance_scale` is defined analog to the guidance weight `w` of equation (2)
         # of the Imagen paper: https://arxiv.org/pdf/2205.11487.pdf . `guidance_scale = 1`
         # corresponds to doing no classifier free guidance.

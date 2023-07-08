@@ -101,6 +101,7 @@ def run_drag_diffusion(
     prompt=DEFAULT_PROMPT,
     handle_points=None,
     target_points=None,
+    output_gif_path=None,
 ):
 
     pipeline = DragDiffusionPipeline.from_pretrained(
@@ -109,6 +110,13 @@ def run_drag_diffusion(
     )
     pipeline.unet.load_attn_procs(lora_model_path)
     pipeline = pipeline.to("cuda")
+
+    def latents_to_imgs(latents):
+        # helper function to show images
+        x = pipeline.decode_image(latents)
+        x = pipeline.torch_to_numpy(x)
+        x = pipeline.numpy_to_pil(x)
+        return x
 
     """
     Prepare inputs
@@ -154,7 +162,30 @@ def run_drag_diffusion(
         handle_points_pt.to('cuda'),
         target_points_pt.to('cuda'),
         steps=120,
+        return_inbetween=(output_gif_path is not None),
     )
+    
+    if output_gif_path:
+        print("Decode intermidiate latents and save as GIF")
+        drag_reverse_latents, intermid_latents = drag_reverse_latents
+        gif_frames = []
+        for lat in intermid_latents:
+            mid_lat = pipeline.backward_diffusion(
+                latents=lat,
+                text_embeddings=text_embeddings,
+                guidance_scale=1,
+                num_inference_steps=50,
+            )
+            gif_frame = latents_to_imgs(mid_lat)[0]
+            gif_frames.append(gif_frame)
+        
+        gif_frames[0].save(
+            output_gif_path,
+            save_all=True,
+            append_images=gif_frames[1:],
+            duration=400,
+            loop=0
+        )
 
     print("Draged latent delta: ", torch.abs(drag_reverse_latents - reversed_latents).mean())
     
@@ -168,13 +199,6 @@ def run_drag_diffusion(
     """
     Visualize result
     """
-
-    # helper function to show images
-    def latents_to_imgs(latents):
-        x = pipeline.decode_image(latents)
-        x = pipeline.torch_to_numpy(x)
-        x = pipeline.numpy_to_pil(x)
-        return x
     
     image = latents_to_imgs(reconstructed_latents)[0]
 
